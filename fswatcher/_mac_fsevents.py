@@ -27,6 +27,8 @@ import sys
 
 from FSEvents import *
 
+__all__ = ['add_watch', 'remove_watch', 'watch']
+
 # Based on http://svn.red-bean.com/pyobjc/branches/pyobjc-20x-branch/pyobjc-framework-FSEvents/Examples/watcher.py
 
 # Time in seconds that the system should wait before noticing an event and
@@ -92,15 +94,3 @@ def watch():
 
     for streaminfo in streams:
         _cleanup_stream(streaminfo)
-
-def main(watch_dirs):
-    def callback(paths):
-        print 'Changes in %s' % str(paths)
-    count = len(watch_dirs)
-    print 'Watching %s...press Ctrl-C to stop.' % (
-        watch_dirs[0] if count == 1 else '%d directories' % count)
-    add_watch(watch_dirs, callback)
-    watch()
-
-if __name__ == '__main__':
-    main(sys.argv[1:])

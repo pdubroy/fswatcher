@@ -32,6 +32,8 @@ import os
 import select
 import struct
 
+__all__ = ['add_watch', 'remove_watch', 'watch']
+
 # Constants defined by sys/inotify.h.
 IN_ACCESS           = 0x00000001
 IN_MODIFY           = 0x00000002
