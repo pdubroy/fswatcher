@@ -37,10 +37,7 @@ streams = []
 watcher_thread = None
 
 class Struct(object):
-    def __init__(self, **entries):
-        self.__dict__.update(entries)
-
-class StreamInfo(Struct): pass
+    def __init__(self, **entries): self.__dict__.update(entries)
 
 def _cleanup_stream(streaminfo):
     stream = streaminfo.stream
@@ -72,7 +69,7 @@ def add_watch(dirs, callback):
         stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode)
 
     streams.append(
-        StreamInfo(stream=stream, dirs=dirs, callback=callback, started=False))
+        Struct(stream=stream, dirs=dirs, callback=callback, started=False))
 
 def remove_watch(dirs, callback):
     pass
