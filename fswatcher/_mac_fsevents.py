@@ -23,6 +23,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import os
 import sys
 
 from FSEvents import *
@@ -38,20 +39,43 @@ latency = DEFAULT_LATENCY = 1
 runloop_ref = None
 streams = []
 
-class Struct(object):
-    def __init__(self, **entries): self.__dict__.update(entries)
 
+class Stream(object):
 
-def _cleanup_stream(streaminfo):
-    stream = streaminfo.stream
-    if streaminfo.started:
-        FSEventStreamStop(stream)
-        streaminfo.started = False
-    if streaminfo.scheduled:
-        FSEventStreamInvalidate(stream)
-        streaminfo.scheduled = False
-    FSEventStreamRelease(stream)
-    streaminfo.stream = None
+    def __init__(self, path, callback):
+        self.path = path
+        self.callback = callback
+        self.started = False
+        self.scheduled = False
+        self.index = FileModificationIndex(path)
+
+        context = callback # This will be passed to the callback as client_info.
+        since_when = kFSEventStreamEventIdSinceNow
+        flags = 0
+        stream_ref = FSEventStreamCreate(
+            None, _fsevents_callback, context, [path], since_when, latency, flags)
+        self.stream = stream_ref
+
+    def start(self, runloop):
+        # Schedule the stream to be processed on the given run loop.
+        FSEventStreamScheduleWithRunLoop(
+            self.stream, runloop, kCFRunLoopDefaultMode)
+        self.scheduled = True
+        if not FSEventStreamStart(self.stream):
+            raise Exception('Failed to start event stream')
+        self.started = True
+
+    def cleanup(self):
+        stream_ref = self.stream
+        if self.started:
+            FSEventStreamStop(stream_ref)
+            self.started = False
+        if self.scheduled:
+            FSEventStreamInvalidate(stream_ref)
+            self.scheduled = False
+        FSEventStreamRelease(stream_ref)
+        self.stream = None
+
 
 def _fsevents_callback(
         stream, client_info, num_events, event_paths, event_flags, event_ids):
@@ -60,24 +84,18 @@ def _fsevents_callback(
     for each in event_paths:
         user_callback(each, None)
 
+
 def add_watch(path, callback):
     pool = NSAutoreleasePool.alloc().init()
-
-    context = callback # This will be passed to our callback as client_info.
-    since_when = kFSEventStreamEventIdSinceNow
-    flags = 0
-    stream = FSEventStreamCreate(
-        None, _fsevents_callback, context, [path], since_when, latency, flags)
-    streams.append(Struct(stream=stream, path=path, callback=callback,
-        started=False, scheduled=False))
+    streams.append(Stream(path, callback))
 
 def remove_watch(path, callback):
     match = None
-    for streaminfo in streams:
-        if streaminfo.path == path and streaminfo.callback == callback:
-            match = streaminfo
+    for stream in streams:
+        if stream.path == path and stream.callback == callback:
+            match = stream
     streams.remove(match)
-    _cleanup_stream(match)
+    match.cleanup()
 
 def watch(path=None, callback=None, timeout=None):
     global runloop_ref, streams
@@ -90,23 +108,57 @@ def watch(path=None, callback=None, timeout=None):
 
     runloop_ref = CFRunLoopGetCurrent()
     
-    for streaminfo in streams:
-        # Schedule the stream to be processed on the current run loop.
-        FSEventStreamScheduleWithRunLoop(
-            streaminfo.stream, runloop_ref, kCFRunLoopDefaultMode)
-        streaminfo.scheduled = True
-        if not FSEventStreamStart(streaminfo.stream):
-            raise Exception('Failed to start event stream')
-        streaminfo.started = True
+    for stream in streams:
+        stream.start(runloop_ref)
 
     if timeout is not None:
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
     else:
         CFRunLoopRun()
 
-    for streaminfo in streams:
-        _cleanup_stream(streaminfo)
+    for stream in streams:
+        stream.cleanup()
     streams = []
 
 def stop_watching():
     CFRunLoopStop(runloop_ref)
+
+
+class FileModificationIndex(object):
+    """Tracks the modification times of all files in a directory tree."""
+
+    def __init__(self, root):
+        self._index = {}
+        self.root = root
+
+    def _refresh_index(self, path):
+        modified = []
+        added = []
+        removed = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            old_files = self._index.get(dirpath, {})
+            new_files = {}
+            for each in filenames:
+                filepath = os.path.join(dirpath, each)
+                mtime = os.stat(filepath).st_mtime
+                files[each] = mtime
+
+                # Keep track of files that were added and modified.
+                if each not in old_files:
+                    added.append(filepath)
+                else:
+                    if old_files[each] != mtime:
+                        modified.append(filepath)
+                    del old_files[each]
+            self._index[dirpath] = new_files
+
+            # Any files left in the old dict must have been deleted.
+            removed.extend(old_files.iter_keys())
+        return (added, removed, modified)
+
+    def build(self):
+        self._refresh_index(root)
+
+    def rescan(self, path):
+        assert os.path.commonprefix(self.root, path) == len(self.root)
+        return self._refresh_index(path)
