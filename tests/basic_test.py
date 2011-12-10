@@ -42,9 +42,22 @@ class BasicTests(unittest.TestCase):
         touch(path)
         fswatcher.watch()
 
-        assert_equal(1, len(self.changes))
+        assert_equal(len(self.changes), 1)
         change_path, event = self.changes.pop()
         assert_paths_equal(path, change_path)
+    
+    def test_delete_file(self):
+        path = join(self.testdir, 'blah')
+        touch(path)
+        fswatcher.watch()
+
+        fswatcher.add_watch(self.testdir, self.change_callback)
+        os.unlink(path)
+        fswatcher.watch()
+        
+        change_path, event = self.changes.pop()
+        assert_paths_equal(path, change_path)
+        assert_equal(event, fswatcher.REMOVED)
 
     def test_new_dir(self):
         path = join(self.testdir, 'some_dir')

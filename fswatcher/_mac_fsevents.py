@@ -70,9 +70,6 @@ class Stream(object):
             for path, what in self.index.rescan(each):
                 self.callback(path, what)
 
-    def build_index(self):
-        self.index.build()
-
     def start(self, runloop=None):
         # Schedule the stream to be processed on the given run loop,
         # or the current run loop if none was specified.
@@ -84,6 +81,11 @@ class Stream(object):
         if not FSEventStreamStart(self.stream):
             raise Exception('Failed to start event stream')
         self.started = True
+
+        # Build the index that is used to determine which file or directory
+        # was added, modified, or deleted. The index should be built after
+        # starting the stream, otherwise some state may be lost.
+        self.index.build()
 
     def cleanup(self):
         stream_ref = self.stream
@@ -101,7 +103,6 @@ def add_watch(path, callback):
     pool = NSAutoreleasePool.alloc().init()
     stream = Stream(path, callback)
     stream.start()
-    stream.build_index()
     streams.append(stream)
 
 def remove_watch(path, callback):
@@ -140,41 +141,54 @@ def stop_watching():
 
 
 class FileModificationIndex(object):
-    """Tracks the modification times of all files in a directory tree."""
+    """Tracks the modification times of all items in a directory tree."""
 
     def __init__(self, root):
         self._index = {}
         self.root = os.path.realpath(root)
 
-    def _refresh_index(self, path):
+    def _rescan(self, path, recursive=False):
+        """Rescan the directory rooted at path and determine which files and
+        directories have changed. Returns a list of tuples (path, change)
+        where change is one of ADDED, MODIFIED, or REMOVED.
+        """
+        if not recursive:
+            return self._get_changes(path, os.listdir(path))
+
         changes = []
         for dirpath, dirnames, filenames in os.walk(path):
-            old_contents = self._index.get(dirpath, {})
-            self._index[dirpath] = new_contents = {}
-            for name in itertools.chain(filenames, dirnames):
-                path = os.path.join(dirpath, name)
-                stat_info = os.stat(path)
-                new_contents[name] = stat_info.st_mtime
-                isdir = stat.S_ISDIR(stat_info.st_mode)
+            entries = itertools.chain(dirnames, filenames)
+            changes.extend(self._get_changes(dirpath, entries))
+        return changes
 
-                # Keep track of files and dirs that were added. For files,
-                # also watch for modifications.
-                if name not in old_contents:
-                    changes.append((path, ADDED))
-                else:
-                    if not isdir and old_contents[name] != new_contents[name]:
-                        changes.append((path, MODIFIED))
-                    del old_contents[name]
+    def _get_changes(self, dirpath, entries):
+        """Determine what changes have occurred in the given directory."""
+        changes = []
+        old_contents = self._index.get(dirpath, {})
+        self._index[dirpath] = new_contents = {}
+        for name in entries:
+            path = os.path.join(dirpath, name)
+            stat_info = os.stat(path)
+            new_contents[name] = stat_info.st_mtime
+            isdir = stat.S_ISDIR(stat_info.st_mode)
 
-            # Any items left in the old dict must have been deleted.
-            for path in (os.path.join(name) for name in old_contents):
-                changes.append((path, REMOVED))
+            # Keep track of files and dirs that were added. For files,
+            # also watch for modifications.
+            if name not in old_contents:
+                changes.append((path, ADDED))
+            else:
+                if not isdir and old_contents[name] != new_contents[name]:
+                    changes.append((path, MODIFIED))
+                del old_contents[name]
+        # Any items left in the old dict must have been deleted.
+        for path in (os.path.join(dirpath, name) for name in old_contents):
+            changes.append((path, REMOVED))
         return changes
 
     def build(self):
-        return self._refresh_index(self.root)
+        return self._rescan(self.root, True)
 
-    def rescan(self, path):
+    def rescan(self, path, recursive=False):
         path = os.path.realpath(path)
         assert os.path.commonprefix([self.root, path]) == self.root
-        return self._refresh_index(path)
+        return self._rescan(path, recursive)
