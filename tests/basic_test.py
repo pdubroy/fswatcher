@@ -44,7 +44,7 @@ class BasicTests(unittest.TestCase):
 
         assert_equal(1, len(self.changes))
         change_path, event = self.changes.pop()
-        assert_paths_equal(self.testdir, change_path)
+        assert_paths_equal(path, change_path)
 
     def test_new_dir(self):
         path = join(self.testdir, 'some_dir')
@@ -53,7 +53,7 @@ class BasicTests(unittest.TestCase):
 
         assert_equal(len(self.changes), 1)
         change_path, event = self.changes.pop()
-        assert_paths_equal(self.testdir, change_path)
+        assert_paths_equal(path, change_path)
 
     def test_remove_watch(self):
         fswatcher.remove_watch(self.testdir, self.change_callback)

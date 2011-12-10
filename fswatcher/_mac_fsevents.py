@@ -23,12 +23,14 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import itertools
 import os
+import stat
 import sys
 
 from FSEvents import *
 
-__all__ = ['add_watch', 'remove_watch', 'watch', 'stop_watching']
+__all__ = ['add_watch', 'remove_watch', 'watch', 'stop_watching', 'ADDED', 'MODIFIED', 'REMOVED']
 
 # Based on http://svn.red-bean.com/pyobjc/branches/pyobjc-20x-branch/pyobjc-framework-FSEvents/Examples/watcher.py
 
@@ -39,8 +41,13 @@ latency = DEFAULT_LATENCY = 1
 runloop_ref = None
 streams = []
 
+ADDED = 'ADDED'
+MODIFIED = 'MODIFIED'
+REMOVED = 'REMOVED'
+
 
 class Stream(object):
+    """Wrapper for a Carbon FSEventStream."""
 
     def __init__(self, path, callback):
         self.path = path
@@ -49,15 +56,28 @@ class Stream(object):
         self.scheduled = False
         self.index = FileModificationIndex(path)
 
-        context = callback # This will be passed to the callback as client_info.
+        context = None # Passed to the callback as client_info.
         since_when = kFSEventStreamEventIdSinceNow
         flags = 0
-        stream_ref = FSEventStreamCreate(
-            None, _fsevents_callback, context, [path], since_when, latency, flags)
+        stream_ref = FSEventStreamCreate(None, self._fsevents_callback,
+            context, [path], since_when, latency, flags)
         self.stream = stream_ref
 
-    def start(self, runloop):
-        # Schedule the stream to be processed on the given run loop.
+    def _fsevents_callback(self, stream, client_info, num_events, event_paths,
+            event_flags, event_ids):
+        # TODO: We should examine event_flags here.
+        for each in event_paths:
+            for path, what in self.index.rescan(each):
+                self.callback(path, what)
+
+    def build_index(self):
+        self.index.build()
+
+    def start(self, runloop=None):
+        # Schedule the stream to be processed on the given run loop,
+        # or the current run loop if none was specified.
+        if runloop is None:
+            runloop = CFRunLoopGetCurrent()
         FSEventStreamScheduleWithRunLoop(
             self.stream, runloop, kCFRunLoopDefaultMode)
         self.scheduled = True
@@ -77,17 +97,12 @@ class Stream(object):
         self.stream = None
 
 
-def _fsevents_callback(
-        stream, client_info, num_events, event_paths, event_flags, event_ids):
-    # TODO: We should examine event_flags here.
-    user_callback = client_info
-    for each in event_paths:
-        user_callback(each, None)
-
-
 def add_watch(path, callback):
     pool = NSAutoreleasePool.alloc().init()
-    streams.append(Stream(path, callback))
+    stream = Stream(path, callback)
+    stream.start()
+    stream.build_index()
+    streams.append(stream)
 
 def remove_watch(path, callback):
     match = None
@@ -107,9 +122,6 @@ def watch(path=None, callback=None, timeout=None):
         add_watch(path, callback)
 
     runloop_ref = CFRunLoopGetCurrent()
-    
-    for stream in streams:
-        stream.start(runloop_ref)
 
     if timeout is not None:
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
@@ -121,7 +133,10 @@ def watch(path=None, callback=None, timeout=None):
     streams = []
 
 def stop_watching():
-    CFRunLoopStop(runloop_ref)
+    global runloop_ref
+    if runloop_ref:
+        CFRunLoopStop(runloop_ref)
+    runloop_ref = None
 
 
 class FileModificationIndex(object):
@@ -129,36 +144,37 @@ class FileModificationIndex(object):
 
     def __init__(self, root):
         self._index = {}
-        self.root = root
+        self.root = os.path.realpath(root)
 
     def _refresh_index(self, path):
-        modified = []
-        added = []
-        removed = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            old_files = self._index.get(dirpath, {})
-            new_files = {}
-            for each in filenames:
-                filepath = os.path.join(dirpath, each)
-                mtime = os.stat(filepath).st_mtime
-                files[each] = mtime
+        changes = []
+        for dirpath, dirnames, filenames in os.walk(path):
+            old_contents = self._index.get(dirpath, {})
+            self._index[dirpath] = new_contents = {}
+            for name in itertools.chain(filenames, dirnames):
+                path = os.path.join(dirpath, name)
+                stat_info = os.stat(path)
+                new_contents[name] = stat_info.st_mtime
+                isdir = stat.S_ISDIR(stat_info.st_mode)
 
-                # Keep track of files that were added and modified.
-                if each not in old_files:
-                    added.append(filepath)
+                # Keep track of files and dirs that were added. For files,
+                # also watch for modifications.
+                if name not in old_contents:
+                    changes.append((path, ADDED))
                 else:
-                    if old_files[each] != mtime:
-                        modified.append(filepath)
-                    del old_files[each]
-            self._index[dirpath] = new_files
+                    if not isdir and old_contents[name] != new_contents[name]:
+                        changes.append((path, MODIFIED))
+                    del old_contents[name]
 
-            # Any files left in the old dict must have been deleted.
-            removed.extend(old_files.iter_keys())
-        return (added, removed, modified)
+            # Any items left in the old dict must have been deleted.
+            for path in (os.path.join(name) for name in old_contents):
+                changes.append((path, REMOVED))
+        return changes
 
     def build(self):
-        self._refresh_index(root)
+        return self._refresh_index(self.root)
 
     def rescan(self, path):
-        assert os.path.commonprefix(self.root, path) == len(self.root)
+        path = os.path.realpath(path)
+        assert os.path.commonprefix([self.root, path]) == self.root
         return self._refresh_index(path)
