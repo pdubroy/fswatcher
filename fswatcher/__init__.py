@@ -34,6 +34,7 @@ elif sys.platform == 'darwin':
 else:
     raise Exception('Unsupported platform: %s' % sys.platform)
 
+
 def main(watch_dirs):
     def callback(paths):
         print 'Changes in %s' % str(paths)
@@ -42,6 +43,7 @@ def main(watch_dirs):
         watch_dirs[0] if count == 1 else '%d directories' % count)
     add_watch(watch_dirs, callback)
     watch()
+
 
 if __name__ == '__main__':
     main(sys.argv[1:])

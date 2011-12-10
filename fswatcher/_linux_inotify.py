@@ -133,7 +133,8 @@ def watch():
             # This will pass the root path that was passed to add_watch,
             # rather than the specific directory that the change occurred.
             # TODO: Is that what we want?
-            watchinfo.callback(watchinfo.path)
+            # TODO: Indicate the type of change with the second parameter.
+            watchinfo.callback(watchinfo.path, None)
 
 def remove_watch(watchdir_path, callback):
     # Find all the matching watches.

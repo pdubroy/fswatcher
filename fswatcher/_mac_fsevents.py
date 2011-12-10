@@ -27,70 +27,86 @@ import sys
 
 from FSEvents import *
 
-__all__ = ['add_watch', 'remove_watch', 'watch']
+__all__ = ['add_watch', 'remove_watch', 'watch', 'stop_watching']
 
 # Based on http://svn.red-bean.com/pyobjc/branches/pyobjc-20x-branch/pyobjc-framework-FSEvents/Examples/watcher.py
 
 # Time in seconds that the system should wait before noticing an event and
 # invoking the callback. Making this bigger improves coalescing.
-LATENCY = 3
+latency = DEFAULT_LATENCY = 1
 
+runloop_ref = None
 streams = []
-watcher_thread = None
 
 class Struct(object):
     def __init__(self, **entries): self.__dict__.update(entries)
+
 
 def _cleanup_stream(streaminfo):
     stream = streaminfo.stream
     if streaminfo.started:
         FSEventStreamStop(stream)
         streaminfo.started = False
-    FSEventStreamInvalidate(stream)
+    if streaminfo.scheduled:
+        FSEventStreamInvalidate(stream)
+        streaminfo.scheduled = False
     FSEventStreamRelease(stream)
     streaminfo.stream = None
 
 def _fsevents_callback(
         stream, client_info, num_events, event_paths, event_flags, event_ids):
     # TODO: We should examine event_flags here.
-    client_info(event_paths)
+    user_callback = client_info
+    for each in event_paths:
+        user_callback(each, None)
 
-def add_watch(dirs, callback):
+def add_watch(path, callback):
     pool = NSAutoreleasePool.alloc().init()
 
-    dirs = list(dirs)
-    since_when = kFSEventStreamEventIdSinceNow
-
-    flags = 0
     context = callback # This will be passed to our callback as client_info.
-    stream = FSEventStreamCreate(None, _fsevents_callback, context, dirs,
-        kFSEventStreamEventIdSinceNow, LATENCY, flags)
+    since_when = kFSEventStreamEventIdSinceNow
+    flags = 0
+    stream = FSEventStreamCreate(
+        None, _fsevents_callback, context, [path], since_when, latency, flags)
+    streams.append(Struct(stream=stream, path=path, callback=callback,
+        started=False, scheduled=False))
 
-    # Schedule the stream to be processed on this thread's run loop.
-    FSEventStreamScheduleWithRunLoop(
-        stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode)
-
-    streams.append(
-        Struct(stream=stream, dirs=dirs, callback=callback, started=False))
-
-def remove_watch(dirs, callback):
-    pass
-
-def watch():
-    pool = NSAutoreleasePool.alloc().init()
+def remove_watch(path, callback):
+    match = None
     for streaminfo in streams:
-        if FSEventStreamStart(streaminfo.stream):
-            streaminfo.started = True
-        else:
-            print 'Failed to start event stream for %s' % dirs
-            _cleanup_stream(streaminfo)
+        if streaminfo.path == path and streaminfo.callback == callback:
+            match = streaminfo
+    streams.remove(match)
+    _cleanup_stream(match)
 
-    while True:
-        try:
-            # Watch for events with a timeout of 1 second.
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1, False)
-        except KeyboardInterrupt:
-            break
+def watch(path=None, callback=None, timeout=None):
+    global runloop_ref, streams
+
+    pool = NSAutoreleasePool.alloc().init()
+
+    if path is not None:
+        assert callback is not None
+        add_watch(path, callback)
+
+    runloop_ref = CFRunLoopGetCurrent()
+    
+    for streaminfo in streams:
+        # Schedule the stream to be processed on the current run loop.
+        FSEventStreamScheduleWithRunLoop(
+            streaminfo.stream, runloop_ref, kCFRunLoopDefaultMode)
+        streaminfo.scheduled = True
+        if not FSEventStreamStart(streaminfo.stream):
+            raise Exception('Failed to start event stream')
+        streaminfo.started = True
+
+    if timeout is not None:
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
+    else:
+        CFRunLoopRun()
 
     for streaminfo in streams:
         _cleanup_stream(streaminfo)
+    streams = []
+
+def stop_watching():
+    CFRunLoopStop(runloop_ref)
