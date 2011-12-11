@@ -28,19 +28,19 @@ class BasicTests(unittest.TestCase):
     def setUp(self):
         self.testdir = tempfile.mkdtemp(prefix='fswatcher-testing-')
         self.changes = []
-        fswatcher.add_watch(self.testdir, self.change_callback)
+        self.watcher = fswatcher.Watcher(self.testdir, self.change_callback)
 
     def tearDown(self):
         shutil.rmtree(self.testdir)
 
     def change_callback(self, path, what):
         self.changes.append((path, what))
-        fswatcher.stop_watching()
+        self.watcher.destroy()
 
     def test_new_file(self):
         path = join(self.testdir, 'blah')
         touch(path)
-        fswatcher.watch()
+        self.watcher.watch()
 
         assert_equal(len(self.changes), 1)
         change_path, event = self.changes.pop()
@@ -49,11 +49,11 @@ class BasicTests(unittest.TestCase):
     def test_delete_file(self):
         path = join(self.testdir, 'blah')
         touch(path)
-        fswatcher.watch()
+        self.watcher.watch()
 
-        fswatcher.add_watch(self.testdir, self.change_callback)
+        watcher = fswatcher.Watcher(self.testdir, self.change_callback)
         os.unlink(path)
-        fswatcher.watch()
+        watcher.watch()
         
         change_path, event = self.changes.pop()
         assert_paths_equal(path, change_path)
@@ -62,32 +62,33 @@ class BasicTests(unittest.TestCase):
     def test_new_dir(self):
         path = join(self.testdir, 'some_dir')
         os.mkdir(path)
-        fswatcher.watch()
+        self.watcher.watch()
 
         assert_equal(len(self.changes), 1)
         change_path, event = self.changes.pop()
         assert_paths_equal(path, change_path)
 
-    def test_remove_watch(self):
-        fswatcher.remove_watch(self.testdir, self.change_callback)
+    def test_remove_watcher(self):
+        self.watcher.destroy()
         touch(join(self.testdir, 'a_file'))
 
         # Unfortunately, this is kind of racey. It can pass simply because
         # the watcher hasn't picked up the change yet. A two second timeout
         # seems to work reliably though.
-        fswatcher.watch(timeout=2)
+        self.watcher = fswatcher.Watcher(self.testdir, self.change_callback)
+        self.watcher.watch(timeout=2)
         assert_equal(len(self.changes), 0)
 
-        # Now try adding a new watch, and removing it inside the callback.
+        # Add a new watch and destroy the watcher inside the callback.
 
         def change_callback(path, what):
             self.changes.append((path, what))
-            fswatcher.remove_watch(self.testdir, change_callback)
+            self.watcher.destroy()
             touch(join(self.testdir, 'file2'))
 
-        fswatcher.add_watch(self.testdir, change_callback)
+        watcher = fswatcher.Watcher(self.testdir, change_callback)
         touch(join(self.testdir, 'file1'))
-        fswatcher.watch(timeout=2)
+        watcher.watch(timeout=2)
         
         # We should only ever see the first change.
         assert_equal(len(self.changes), 1)

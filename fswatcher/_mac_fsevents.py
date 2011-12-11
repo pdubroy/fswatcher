@@ -23,6 +23,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import functools
 import itertools
 import os
 import stat
@@ -30,7 +31,7 @@ import sys
 
 from FSEvents import *
 
-__all__ = ['add_watch', 'remove_watch', 'watch', 'stop_watching', 'ADDED', 'MODIFIED', 'REMOVED']
+__all__ = ['Watcher', 'ADDED', 'MODIFIED', 'REMOVED']
 
 # Based on http://svn.red-bean.com/pyobjc/branches/pyobjc-20x-branch/pyobjc-framework-FSEvents/Examples/watcher.py
 
@@ -38,18 +39,15 @@ __all__ = ['add_watch', 'remove_watch', 'watch', 'stop_watching', 'ADDED', 'MODI
 # invoking the callback. Making this bigger improves coalescing.
 latency = DEFAULT_LATENCY = 1
 
-runloop_ref = None
-streams = []
-
 ADDED = 'ADDED'
 MODIFIED = 'MODIFIED'
 REMOVED = 'REMOVED'
 
 
-class Stream(object):
+class _Stream(object):
     """Wrapper for a Carbon FSEventStream."""
 
-    def __init__(self, path, callback):
+    def __init__(self, path, callback, start=True):
         self.path = path
         self.callback = callback
         self.started = False
@@ -62,6 +60,8 @@ class Stream(object):
         stream_ref = FSEventStreamCreate(None, self._fsevents_callback,
             context, [path], since_when, latency, flags)
         self.stream = stream_ref
+        
+        if start: self.start()
 
     def _fsevents_callback(self, stream, client_info, num_events, event_paths,
             event_flags, event_ids):
@@ -87,7 +87,7 @@ class Stream(object):
         # starting the stream, otherwise some state may be lost.
         self.index.build()
 
-    def cleanup(self):
+    def destroy(self):
         stream_ref = self.stream
         if self.started:
             FSEventStreamStop(stream_ref)
@@ -99,45 +99,33 @@ class Stream(object):
         self.stream = None
 
 
-def add_watch(path, callback):
-    pool = NSAutoreleasePool.alloc().init()
-    stream = Stream(path, callback)
-    stream.start()
-    streams.append(stream)
+class Watcher(object):
+    
+    def __init__(self, paths, callback):
+        pool = NSAutoreleasePool.alloc().init()
+        paths = (paths,) if isinstance(paths, basestring) else paths
+        self.streams = [_Stream(path, callback, True) for path in paths]
 
-def remove_watch(path, callback):
-    match = None
-    for stream in streams:
-        if stream.path == path and stream.callback == callback:
-            match = stream
-    streams.remove(match)
-    match.cleanup()
+    def watch(self, timeout=None):
+        pool = NSAutoreleasePool.alloc().init()
+        if timeout is not None:
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
+        else:
+            CFRunLoopRun()
 
-def watch(path=None, callback=None, timeout=None):
-    global runloop_ref, streams
+    def stop_watching(self):
+        pool = NSAutoreleasePool.alloc().init()
+        CFRunLoopStop(CFRunLoopGetCurrent())
 
-    pool = NSAutoreleasePool.alloc().init()
+    def destroy(self):
+        pool = NSAutoreleasePool.alloc().init()
+        self.stop_watching()
+        for stream in self.streams:
+            stream.destroy()
+        self.streams = []
 
-    if path is not None:
-        assert callback is not None
-        add_watch(path, callback)
-
-    runloop_ref = CFRunLoopGetCurrent()
-
-    if timeout is not None:
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
-    else:
-        CFRunLoopRun()
-
-    for stream in streams:
-        stream.cleanup()
-    streams = []
-
-def stop_watching():
-    global runloop_ref
-    if runloop_ref:
-        CFRunLoopStop(runloop_ref)
-    runloop_ref = None
+    def __del__(self):
+        self.destroy()
 
 
 class FileModificationIndex(object):

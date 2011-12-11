@@ -25,7 +25,7 @@
 
 import sys
 
-__all__ = ['add_watch', 'remove_watch', 'watch']
+__all__ = ['Watcher', 'ADDED', 'MODIFIED', 'REMOVED']
 
 if sys.platform.startswith('linux'):
     from _linux_inotify import *
