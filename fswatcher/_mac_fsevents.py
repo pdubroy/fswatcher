@@ -23,15 +23,18 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import errno
 import functools
 import itertools
+import multiprocessing
 import os
 import stat
 import sys
+import threading
+
+import objc
 
 from FSEvents import *
-
-__all__ = ['Watcher', 'ADDED', 'MODIFIED', 'REMOVED']
 
 # Based on http://svn.red-bean.com/pyobjc/branches/pyobjc-20x-branch/pyobjc-framework-FSEvents/Examples/watcher.py
 
@@ -44,10 +47,67 @@ MODIFIED = 'MODIFIED'
 REMOVED = 'REMOVED'
 
 
-class _Stream(object):
-    """Wrapper for a Carbon FSEventStream."""
+def watch_concurrently(paths):
+    master_conn, slave_conn = multiprocessing.Pipe()
 
-    def __init__(self, path, callback, start=True):
+    # The master side of the pipe needs a reference to the watcher thread's
+    # run loop, in order to wake the thread when there's a message ready.
+    run_loop = threading.Event()
+
+    def thread_main():
+        # Store the value in the Event object, and signal the master thread.
+        run_loop.value = CFRunLoopGetCurrent()
+        run_loop.set()
+
+        watcher = Watcher(paths, slave_conn)
+        for change in watcher.get_changes():
+            pass
+        slave_conn.send(None)
+
+    threading.Thread(target=thread_main).start()
+
+    # Wait for the watcher thread to store the run_loop.
+    run_loop.wait()
+
+    # Return a proxy for the master end of the pipe.
+    return _ConnectionProxy(master_conn, run_loop.value)
+
+
+def get_changes(paths, timeout=None):
+    return Watcher(path).get_changes(timeout)
+
+
+class _ConnectionProxy(object):
+    """Proxy class for multiprocessing.Connection, used on one side of a Pipe
+    when the thread on the other end is running a Core Foundation run loop.
+    """
+
+    def __init__(self, conn, run_loop):
+        """Create a proxy for the given connection object. `run_loop` is a
+        reference to the other thread's run loop.
+        """
+        self._conn = conn
+        self._run_loop = run_loop
+
+    def send(self, obj):
+        """Send a message and wake the run loop."""
+        self._conn.send(obj)
+        CFRunLoopWakeUp(self._run_loop)
+
+    def send_bytes(self, *args, **kwargs):
+        """Send a message and wake the run loop."""
+        self._conn.send_bytes(*args, **kwargs)
+        CFRunLoopWakeUp(self._run_loop)
+
+    def __getattr__(self, name):
+        """Proxy everything else to the Connection instance."""
+        return getattr(self._conn, name)
+
+
+class _Stream(object):
+    """Wrapper for a Core Foundation FSEventStream."""
+
+    def __init__(self, path, callback):
         self.path = path
         self.callback = callback
         self.started = False
@@ -61,14 +121,15 @@ class _Stream(object):
             context, [path], since_when, latency, flags)
         self.stream = stream_ref
         
-        if start: self.start()
+        self.start()
 
     def _fsevents_callback(self, stream, client_info, num_events, event_paths,
             event_flags, event_ids):
         # TODO: We should examine event_flags here.
         for each in event_paths:
             for path, what in self.index.rescan(each):
-                self.callback(path, what)
+                if self.callback:
+                    self.callback(path, what)
 
     def start(self, runloop=None):
         # Schedule the stream to be processed on the given run loop,
@@ -99,33 +160,100 @@ class _Stream(object):
         self.stream = None
 
 
+class _ChangeIterator(object):
+
+    def __init__(self, watcher, timeout):
+        self.watcher = watcher
+        self.timeout = timeout
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        return self.watcher.next_change(self.timeout)
+
+
 class Watcher(object):
     
-    def __init__(self, paths, callback):
-        pool = NSAutoreleasePool.alloc().init()
-        paths = (paths,) if isinstance(paths, basestring) else paths
-        self.streams = [_Stream(path, callback, True) for path in paths]
+    def __init__(self, paths, conn=None):
+        self.paths = (paths,) if isinstance(paths, basestring) else paths
+        self.conn = conn
+        self.changes = []
+        self._start()
 
-    def watch(self, timeout=None):
+    def _thread_check(self):
+        if hasattr(self, '_thread_local'):
+            assert hasattr(self._thread_local, 'is_owner')
+        else:
+            self._thread_local = threading.local()
+            self._thread_local.is_owner = True
+
+    def _start(self):
         pool = NSAutoreleasePool.alloc().init()
+
+        assert not hasattr(self, 'streams'), 'Watcher already started.'
+        self._thread_check()
+
+        callback = lambda path, what: self.changes.append((path, what))
+        self.streams = [_Stream(path, callback) for path in self.paths]
+
+        run_loop = CFRunLoopGetCurrent()
+
+        def before_waiting(*args):
+            # Stop the run loop if there are any changes to process.
+            if len(self.changes) > 0:
+                CFRunLoopStop(run_loop)
+            self._process_messages()
+        
+        observer = CFRunLoopObserverCreate(
+            objc.NULL, kCFRunLoopBeforeWaiting, YES, 0, before_waiting, None)
+        CFRunLoopAddObserver(run_loop, observer, kCFRunLoopCommonModes)
+
+    def _process_messages(self):
+        # Process any messages on the connection.
+        conn = self.conn
+        while conn and conn.poll():
+            message = self.conn.recv()
+            if message == "stop":
+                CFRunLoopStop(CFRunLoopGetCurrent())
+                conn.send(None)
+            elif message == 'get_index_size':
+                conn.send(self.index_size())
+
+    def next_change(self, timeout=None):
+        # If there are pending chanages, return right away.
+        if self.changes:
+            return self.changes.pop()
+
+        # Enter the run loop until a change is found or the timeout expires.
         if timeout is not None:
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, timeout, False)
         else:
             CFRunLoopRun()
 
-    def stop_watching(self):
+        return self.changes.pop() if self.changes else None
+
+    def get_changes(self, timeout=None):
         pool = NSAutoreleasePool.alloc().init()
-        CFRunLoopStop(CFRunLoopGetCurrent())
+        self._thread_check()
+        return _ChangeIterator(self, timeout)
 
     def destroy(self):
         pool = NSAutoreleasePool.alloc().init()
-        self.stop_watching()
+        self._thread_check()
+        CFRunLoopObserverInvalidate(observer)
         for stream in self.streams:
             stream.destroy()
         self.streams = []
 
     def __del__(self):
         self.destroy()
+
+    def index_size(self):
+        if len(self.streams) > 0:
+            assert len(self.streams) == 1
+            return self.streams[0].index.size()
+        return 0
 
 
 class FileModificationIndex(object):
@@ -141,7 +269,13 @@ class FileModificationIndex(object):
         where change is one of ADDED, MODIFIED, or REMOVED.
         """
         if not recursive:
-            return self._get_changes(path, os.listdir(path))
+            # Ignore an exception caused by the directory being deleted.
+            try:
+                return self._get_changes(path, os.listdir(path))
+            except OSError, e:
+                if e.errno == errno.ENOENT:
+                    return []
+                raise
 
         changes = []
         for dirpath, dirnames, filenames in os.walk(path):
@@ -156,7 +290,14 @@ class FileModificationIndex(object):
         self._index[dirpath] = new_contents = {}
         for name in entries:
             path = os.path.join(dirpath, name)
-            stat_info = os.stat(path)
+            try:
+                stat_info = os.stat(path)
+            except OSError as e:
+                # File no longer exists -- not much we can do about it.
+                if e.errno == errno.ENOENT:
+                    continue
+                raise
+                
             new_contents[name] = stat_info.st_mtime
             isdir = stat.S_ISDIR(stat_info.st_mode)
 
@@ -180,3 +321,6 @@ class FileModificationIndex(object):
         path = os.path.realpath(path)
         assert os.path.commonprefix([self.root, path]) == self.root
         return self._rescan(path, recursive)
+
+    def size(self):
+        return sum(len(entries) for entries in self._index.values())

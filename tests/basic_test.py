@@ -1,11 +1,10 @@
 import os
-import Queue
 import shutil
 import tempfile
-import threading
+import time
 import unittest
 
-from nose.tools import *
+from nose.tools import assert_equal
 from os.path import join, realpath
 
 import fswatcher
@@ -19,76 +18,106 @@ def touch(path):
         open(path, 'w').close()    
 
 
-def assert_paths_equal(one, other):
-    assert_equal(realpath(one), realpath(other))
+def check_change(change, expected):
+    change_path, change_event = change
+    path, event = expected
+
+    assert_equal(realpath(path), realpath(change_path))
+    assert_equal(event, change_event)
+    
+
+def no_more_changes(watcher):
+    return watcher.next_change(timeout=2) is None
 
 
 class BasicTests(unittest.TestCase):
 
     def setUp(self):
-        self.testdir = tempfile.mkdtemp(prefix='fswatcher-testing-')
-        self.changes = []
-        self.watcher = fswatcher.Watcher(self.testdir, self.change_callback)
+        self.testdir = tempfile.mkdtemp(prefix='fswatcher-test-')
+        self.watcher = fswatcher.Watcher(self.testdir)
 
     def tearDown(self):
         shutil.rmtree(self.testdir)
 
-    def change_callback(self, path, what):
-        self.changes.append((path, what))
-        self.watcher.destroy()
-
     def test_new_file(self):
         path = join(self.testdir, 'blah')
         touch(path)
-        self.watcher.watch()
 
-        assert_equal(len(self.changes), 1)
-        change_path, event = self.changes.pop()
-        assert_paths_equal(path, change_path)
+        change = self.watcher.next_change(timeout=2)
+        check_change(change, (path, fswatcher.ADDED))
+
+        assert no_more_changes(self.watcher)
     
     def test_delete_file(self):
         path = join(self.testdir, 'blah')
         touch(path)
-        self.watcher.watch()
 
-        watcher = fswatcher.Watcher(self.testdir, self.change_callback)
+        change = self.watcher.next_change(timeout=2)
+        check_change(change, (path, fswatcher.ADDED))
+
         os.unlink(path)
-        watcher.watch()
+        change = self.watcher.next_change(timeout=2)
+        check_change(change, (path, fswatcher.REMOVED))
         
-        change_path, event = self.changes.pop()
-        assert_paths_equal(path, change_path)
-        assert_equal(event, fswatcher.REMOVED)
+        assert no_more_changes(self.watcher)
 
     def test_new_dir(self):
         path = join(self.testdir, 'some_dir')
         os.mkdir(path)
-        self.watcher.watch()
 
-        assert_equal(len(self.changes), 1)
-        change_path, event = self.changes.pop()
-        assert_paths_equal(path, change_path)
-
-    def test_remove_watcher(self):
-        self.watcher.destroy()
-        touch(join(self.testdir, 'a_file'))
-
-        # Unfortunately, this is kind of racey. It can pass simply because
-        # the watcher hasn't picked up the change yet. A two second timeout
-        # seems to work reliably though.
-        self.watcher = fswatcher.Watcher(self.testdir, self.change_callback)
-        self.watcher.watch(timeout=2)
-        assert_equal(len(self.changes), 0)
-
-        # Add a new watch and destroy the watcher inside the callback.
-
-        def change_callback(path, what):
-            self.changes.append((path, what))
-            self.watcher.destroy()
-            touch(join(self.testdir, 'file2'))
-
-        watcher = fswatcher.Watcher(self.testdir, change_callback)
-        touch(join(self.testdir, 'file1'))
-        watcher.watch(timeout=2)
+        change = self.watcher.next_change(timeout=2)
+        check_change(change, (path, fswatcher.ADDED))
         
-        # We should only ever see the first change.
-        assert_equal(len(self.changes), 1)
+        assert no_more_changes(self.watcher)
+
+
+class ConcurrentTests(unittest.TestCase):
+
+    def setUp(self):
+        self.connections = []
+        self.testdir = tempfile.mkdtemp(prefix='fswatcher-test-')
+
+    def create_files(self, path, count, depth, top_level=True):
+        """Recursively creates a bunch of files and directories, and    
+        returns the number of files and directories that were created.
+        
+        At each iteration of the top-level loop, a new watcher is created.
+        """
+        if depth <= 0:
+            return 0
+
+        entries = 0
+        for i in xrange(count):
+            if top_level:
+                conn = fswatcher.watch_concurrently(self.testdir)
+                self.connections.append(conn)
+
+            touch(join(path, 'file%d' % i))
+            dirpath = join(path, 'dir%d' % i)
+            os.mkdir(dirpath)
+            entries += 1 + self.create_files(dirpath, count, depth - 1, False)
+
+        return entries
+
+    def test_concurrency(self):
+        MAX_WAIT_TIME = 4
+        try:
+            # Create a bunch of files and directories, and create
+            # several watchers at regular intervals.
+            count = self.create_files(self.testdir, 4, 6)
+
+            # Check that all the watchers eventually achieve the right count.
+            start_time = time.time()
+            for conn in self.connections:
+                size = 0
+                while size < count:
+                    conn.send("get_index_size")
+                    size = conn.recv()
+                    if time.time() - start_time >= MAX_WAIT_TIME:
+                        assert_equal(size, count)
+                    time.sleep(1)
+        finally:
+            for conn in self.connections:
+                conn.send("stop")
+                conn.recv() # Wait for the thread to stop.
+            shutil.rmtree(self.testdir)
