@@ -37,6 +37,7 @@ class BasicTests(unittest.TestCase):
         self.watcher = fswatcher.Watcher(self.testdir)
 
     def tearDown(self):
+        assert 'fswatcher-test' in self.testdir
         shutil.rmtree(self.testdir)
 
     def test_new_file(self):
@@ -71,11 +72,29 @@ class BasicTests(unittest.TestCase):
         assert no_more_changes(self.watcher)
 
 
+def wait_for_index_size(conn, expected_size):
+    MAX_WAIT_TIME = 4
+
+    start_time = time.time()
+    size = 0
+    while size < expected_size:
+        conn.send("get_index_size")
+        size = conn.recv()
+        if time.time() - start_time >= MAX_WAIT_TIME:
+            assert_equal(size, count)
+        time.sleep(1)
+
+
 class ConcurrentTests(unittest.TestCase):
 
     def setUp(self):
         self.connections = []
         self.testdir = tempfile.mkdtemp(prefix='fswatcher-test-')
+
+    def tearDown(self):
+        if os.path.exists(self.testdir):
+            assert 'fswatcher-test' in self.testdir
+            shutil.rmtree(self.testdir)
 
     def create_files(self, path, count, depth, top_level=True):
         """Recursively creates a bunch of files and directories, and    
@@ -100,24 +119,20 @@ class ConcurrentTests(unittest.TestCase):
         return entries
 
     def test_concurrency(self):
-        MAX_WAIT_TIME = 4
-        try:
-            # Create a bunch of files and directories, and create
-            # several watchers at regular intervals.
-            count = self.create_files(self.testdir, 4, 6)
 
-            # Check that all the watchers eventually achieve the right count.
-            start_time = time.time()
-            for conn in self.connections:
-                size = 0
-                while size < count:
-                    conn.send("get_index_size")
-                    size = conn.recv()
-                    if time.time() - start_time >= MAX_WAIT_TIME:
-                        assert_equal(size, count)
-                    time.sleep(1)
-        finally:
-            for conn in self.connections:
-                conn.send("stop")
-                conn.recv() # Wait for the thread to stop.
-            shutil.rmtree(self.testdir)
+        # Create a bunch of files and directories, and create
+        # several watchers at regular intervals.
+        count = self.create_files(self.testdir, 4, 6)
+
+        # Check that all the watchers eventually achieve the right count.
+        for conn in self.connections:
+            wait_for_index_size(conn, count)
+
+        shutil.rmtree(self.testdir)
+
+        for conn in self.connections:
+            wait_for_index_size(conn, 0)
+
+        for conn in self.connections:
+            conn.send("stop")
+            conn.recv() # Wait for the thread to stop.
