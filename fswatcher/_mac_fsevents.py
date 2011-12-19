@@ -27,6 +27,7 @@ import errno
 import functools
 import itertools
 import multiprocessing
+import operator
 import os
 import stat
 import sys
@@ -74,7 +75,7 @@ def watch_concurrently(paths):
 
 
 def get_changes(paths, timeout=None):
-    return Watcher(path).get_changes(timeout)
+    return Watcher(paths).get_changes(timeout)
 
 
 class _ConnectionProxy(object):
@@ -126,10 +127,9 @@ class _Stream(object):
     def _fsevents_callback(self, stream, client_info, num_events, event_paths,
             event_flags, event_ids):
         # TODO: We should examine event_flags here.
-        for each in event_paths:
-            for path, what in self.index.rescan(each):
-                if self.callback:
-                    self.callback(path, what)
+        all_changes = reduce(
+            operator.add, (self.index.rescan(path) for path in event_paths))
+        self.callback(all_changes)
 
     def start(self, runloop=None):
         # Schedule the stream to be processed on the given run loop,
@@ -176,6 +176,7 @@ class _ChangeIterator(object):
 class Watcher(object):
     
     def __init__(self, paths, conn=None):
+        pool = NSAutoreleasePool.alloc().init()
         self.paths = (paths,) if isinstance(paths, basestring) else paths
         self.conn = conn
         self.changes = []
@@ -189,13 +190,10 @@ class Watcher(object):
             self._thread_local.is_owner = True
 
     def _start(self):
-        pool = NSAutoreleasePool.alloc().init()
-
         assert not hasattr(self, 'streams'), 'Watcher already started.'
         self._thread_check()
 
-        callback = lambda path, what: self.changes.append((path, what))
-        self.streams = [_Stream(path, callback) for path in self.paths]
+        self.streams = [_Stream(p, self.changes.extend) for p in self.paths]
 
         run_loop = CFRunLoopGetCurrent()
 
@@ -221,7 +219,8 @@ class Watcher(object):
                 conn.send(self.index_size())
 
     def next_change(self, timeout=None):
-        # If there are pending chanages, return right away.
+        pool = NSAutoreleasePool.alloc().init()
+
         if self.changes:
             return self.changes.pop()
 
@@ -250,6 +249,7 @@ class Watcher(object):
         self.destroy()
 
     def index_size(self):
+        pool = NSAutoreleasePool.alloc().init()
         if len(self.streams) > 0:
             assert len(self.streams) == 1
             return self.streams[0].index.size()

@@ -36,14 +36,22 @@ else:
 
 
 def main(watch_dirs):
-    def callback(paths):
-        print 'Changes in %s' % str(paths)
     count = len(watch_dirs)
     print 'Watching %s...press Ctrl-C to stop.' % (
         watch_dirs[0] if count == 1 else '%d directories' % count)
-    add_watch(watch_dirs, callback)
-    watch()
-
+    try:
+        for change in get_changes(watch_dirs, timeout=5):
+            if change is None:
+                continue
+            path, event = change
+            descriptions = {
+                ADDED: 'A',
+                MODIFIED: 'M',
+                REMOVED: 'R'
+            }
+            print '%s %s' % (descriptions[event], path)
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == '__main__':
     main(sys.argv[1:])
