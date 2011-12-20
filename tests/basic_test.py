@@ -81,7 +81,7 @@ def wait_for_index_size(conn, expected_size):
         conn.send("get_index_size")
         size = conn.recv()
         if time.time() - start_time >= MAX_WAIT_TIME:
-            assert_equal(size, count)
+            assert_equal(size, expected_size)
         time.sleep(1)
 
 
@@ -96,7 +96,7 @@ class ConcurrentTests(unittest.TestCase):
             assert 'fswatcher-test' in self.testdir
             shutil.rmtree(self.testdir)
 
-    def create_files(self, path, count, depth, top_level=True):
+    def create_files(self, path, count, depth, create_watchers=True):
         """Recursively creates a bunch of files and directories, and    
         returns the number of files and directories that were created.
         
@@ -107,8 +107,8 @@ class ConcurrentTests(unittest.TestCase):
 
         entries = 0
         for i in xrange(count):
-            if top_level:
-                conn = fswatcher.watch_concurrently(self.testdir)
+            if create_watchers:
+                conn, _ = fswatcher.watch_concurrently(self.testdir)
                 self.connections.append(conn)
 
             touch(join(path, 'file%d' % i))
@@ -119,7 +119,6 @@ class ConcurrentTests(unittest.TestCase):
         return entries
 
     def test_concurrency(self):
-
         # Create a bunch of files and directories, and create
         # several watchers at regular intervals.
         count = self.create_files(self.testdir, 4, 6)
@@ -134,5 +133,4 @@ class ConcurrentTests(unittest.TestCase):
             wait_for_index_size(conn, 0)
 
         for conn in self.connections:
-            conn.send("stop")
-            conn.recv() # Wait for the thread to stop.
+            conn.send('stop')

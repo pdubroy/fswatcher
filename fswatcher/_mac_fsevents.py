@@ -29,6 +29,7 @@ import itertools
 import multiprocessing
 import operator
 import os
+import Queue
 import stat
 import sys
 import threading
@@ -50,6 +51,8 @@ REMOVED = 'REMOVED'
 
 def watch_concurrently(paths):
     master_conn, slave_conn = multiprocessing.Pipe()
+    # TODO: Use a multiprocessing.Queue when separate processes are supported.
+    queue = Queue.Queue()
 
     # The master side of the pipe needs a reference to the watcher thread's
     # run loop, in order to wake the thread when there's a message ready.
@@ -62,16 +65,32 @@ def watch_concurrently(paths):
 
         watcher = Watcher(paths, slave_conn)
         for change in watcher.get_changes():
-            pass
-        slave_conn.send(None)
+            if change:
+                queue.put(change)
+            if _process_messages(watcher, slave_conn):
+                break
 
-    threading.Thread(target=thread_main).start()
+    thread = threading.Thread(target=thread_main)
+    thread.start()
 
     # Wait for the watcher thread to store the run_loop.
     run_loop.wait()
 
-    # Return a proxy for the master end of the pipe.
-    return _ConnectionProxy(master_conn, run_loop.value)
+    master_conn = _ConnectionProxy(master_conn, thread, run_loop.value)
+    return (master_conn, queue)
+
+
+def _process_messages(watcher, conn):
+    while conn.poll():
+        message = conn.recv()
+        if message == 'stop':
+            CFRunLoopStop(CFRunLoopGetCurrent())
+            return True
+        elif message == 'get_index_size':
+            conn.send(watcher.index_size())
+        else:
+            conn.send(RuntimeException('Unrecognized message %s' % message))
+    return False
 
 
 def get_changes(paths, timeout=None):
@@ -83,22 +102,26 @@ class _ConnectionProxy(object):
     when the thread on the other end is running a Core Foundation run loop.
     """
 
-    def __init__(self, conn, run_loop):
+    def __init__(self, conn, thread, run_loop):
         """Create a proxy for the given connection object. `run_loop` is a
         reference to the other thread's run loop.
         """
         self._conn = conn
+        self._thread = thread
         self._run_loop = run_loop
 
     def send(self, obj):
         """Send a message and wake the run loop."""
         self._conn.send(obj)
-        CFRunLoopWakeUp(self._run_loop)
+        CFRunLoopStop(self._run_loop)
+        # Hack to ensure proper thread shutdown.
+        if obj == 'stop':
+            self._thread.join()
 
     def send_bytes(self, *args, **kwargs):
         """Send a message and wake the run loop."""
         self._conn.send_bytes(*args, **kwargs)
-        CFRunLoopWakeUp(self._run_loop)
+        CFRunLoopStop(self._run_loop)
 
     def __getattr__(self, name):
         """Proxy everything else to the Connection instance."""
@@ -201,22 +224,10 @@ class Watcher(object):
             # Stop the run loop if there are any changes to process.
             if len(self.changes) > 0:
                 CFRunLoopStop(run_loop)
-            self._process_messages()
         
         observer = CFRunLoopObserverCreate(
             objc.NULL, kCFRunLoopBeforeWaiting, YES, 0, before_waiting, None)
         CFRunLoopAddObserver(run_loop, observer, kCFRunLoopCommonModes)
-
-    def _process_messages(self):
-        # Process any messages on the connection.
-        conn = self.conn
-        while conn and conn.poll():
-            message = self.conn.recv()
-            if message == "stop":
-                CFRunLoopStop(CFRunLoopGetCurrent())
-                conn.send(None)
-            elif message == 'get_index_size':
-                conn.send(self.index_size())
 
     def next_change(self, timeout=None):
         pool = NSAutoreleasePool.alloc().init()
